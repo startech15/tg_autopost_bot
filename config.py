@@ -1,24 +1,19 @@
 import os
+from datetime import timedelta
 
 # Конфигурация бота
-BOT_TOKEN = "6104374357:AAGO3m_9dLf5u6-PeKNZ6UmHjngV97JcD-Q"  # Замените на ваш токен
+BOT_TOKEN = os.getenv('BOT_TOKEN', '6104374357:AAG2AoC3_WnK0itiVJphmpWp1GegAprrV0U')
 
 # Настройки базы данных
-DB_FILE = "scheduler_database.db"
+DATABASE_NAME = 'autopost_bot.db'
 
-# Директории для хранения контента
-UPLOAD_DIRS = {
-    'photo': 'uploaded_content/images',
-    'video': 'uploaded_content/videos',
-    'document': 'uploaded_content/documents',
-    'audio': 'uploaded_content/audio'
-}
+# Настройки подписки
+FREE_TIER_POSTS = 10
+TRIAL_PERIOD_DAYS = 14
+SUBSCRIPTION_PRICE_STARS = 100  # Цена подписки в звездах
 
-# Создаем директории если не существуют
-for dir_path in UPLOAD_DIRS.values():
-    os.makedirs(dir_path, exist_ok=True)
-os.makedirs('uploaded_content', exist_ok=True)
+# Доступные типы контента
+ALLOWED_CONTENT_TYPES = ['text', 'photo', 'video', 'document']
 
 # Настройки планировщика
-CHECK_INTERVAL = 30  # секунды
-MAX_SCHEDULE_DAYS = 30  # максимальное планирование на дней вперед
+SCHEDULER_TIMEZONE = 'UTC+3'
