@@ -28,9 +28,12 @@ class ContentManager:
             # Создаем директорию если не существует
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
+            # Получаем файл как объект
+            file_obj = await file_data
+
             # СПОСОБ 1: Пытаемся использовать download_to_drive
             try:
-                await file_data.download_to_drive(custom_path=file_path)
+                await file_obj.download_to_drive(custom_path=file_path)
                 print(f"DEBUG: ✅ Файл успешно сохранен (способ 1): {file_path}")
                 return file_path
             except Exception as e1:
@@ -38,7 +41,7 @@ class ContentManager:
 
                 # СПОСОБ 2: Используем download_as_bytearray
                 try:
-                    file_bytes = await file_data.download_as_bytearray()
+                    file_bytes = await file_obj.download_as_bytearray()
                     with open(file_path, 'wb') as f:
                         f.write(file_bytes)
                     print(f"DEBUG: ✅ Файл успешно сохранен (способ 2): {file_path}")
@@ -48,12 +51,15 @@ class ContentManager:
 
                     # СПОСОБ 3: Используем file_path из Telegram
                     try:
-                        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_data.file_path}"
-                        response = requests.get(file_url)
-                        with open(file_path, 'wb') as f:
-                            f.write(response.content)
-                        print(f"DEBUG: ✅ Файл успешно сохранен (способ 3): {file_path}")
-                        return file_path
+                        if hasattr(file_obj, 'file_path'):
+                            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_obj.file_path}"
+                            response = requests.get(file_url)
+                            with open(file_path, 'wb') as f:
+                                f.write(response.content)
+                            print(f"DEBUG: ✅ Файл успешно сохранен (способ 3): {file_path}")
+                            return file_path
+                        else:
+                            raise Exception("File path not available")
                     except Exception as e3:
                         print(f"DEBUG: ❌ Все способы не сработали: {e3}")
                         raise Exception(f"Не удалось сохранить файл: {e3}")
@@ -123,28 +129,3 @@ class ContentManager:
         exists = os.path.exists(file_path)
         print(f"DEBUG: 🔍 Файл {file_path} существует: {exists}")
         return exists
-
-    def list_uploaded_files(self):
-        """Список всех загруженных файлов (для отладки)"""
-        print("DEBUG: 📂 Список загруженных файлов:")
-
-        for content_type, dir_path in self.upload_dirs.items():
-            if os.path.exists(dir_path):
-                files = os.listdir(dir_path)
-                print(f"DEBUG: 📁 {content_type}: {len(files)} файлов")
-                for file in files[:5]:  # Показываем первые 5 файлов
-                    file_path = os.path.join(dir_path, file)
-                    file_size = os.path.getsize(file_path)
-                    print(f"DEBUG:    📄 {file} ({file_size} байт)")
-            else:
-                print(f"DEBUG: 📁 {content_type}: директория не существует")
-
-        # Проверяем текстовые файлы
-        text_dir = 'uploaded_content'
-        if os.path.exists(text_dir):
-            text_files = [f for f in os.listdir(text_dir) if f.endswith('.txt')]
-            print(f"DEBUG: 📁 text: {len(text_files)} файлов")
-            for file in text_files[:5]:
-                file_path = os.path.join(text_dir, file)
-                file_size = os.path.getsize(file_path)
-                print(f"DEBUG:    📄 {file} ({file_size} байт)")

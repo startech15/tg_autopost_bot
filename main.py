@@ -1,13 +1,13 @@
-import asyncio
+import os
 import logging
+import asyncio
 from datetime import datetime, timedelta
-from telegram import Update, Bot, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes
-from telegram.ext import filters
-import re
-import sqlite3
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, DB_FILE
+from config import BOT_TOKEN
 from database import ContentDatabase
 from content_manager import ContentManager
 from scheduler import PostScheduler
@@ -22,879 +22,906 @@ logger = logging.getLogger(__name__)
 # Инициализация компонентов
 db = ContentDatabase()
 content_manager = ContentManager()
-scheduler = PostScheduler(DB_FILE)
+scheduler = PostScheduler("scheduler_database.db")
 
-# Глобальные переменные для хранения состояния пользователей
-user_states = {}
+# Состояния для ConversationHandler
+SELECTING_CHANNEL, SELECTING_CONTENT_TYPE, WAITING_CONTENT, WAITING_CAPTION, WAITING_SCHEDULE_TIME = range(5)
 
 
-class TelegramSchedulerBot:
+class TelegramAutopostBot:
     def __init__(self):
-        self.application = None
-
-    async def initialize(self):
-        """Инициализация бота"""
         self.application = Application.builder().token(BOT_TOKEN).build()
-        await self.setup_handlers()
-        await self.setup_menu_commands()
+        self.setup_handlers()
 
-    async def setup_menu_commands(self):
-        """Настройка меню команд бота"""
-        commands = [
-            BotCommand("start", "🚀 Начать работу с ботом"),
-            BotCommand("help", "📖 Получить справку по командам"),
-            BotCommand("schedule", "📅 Запланировать новый пост"),
-            BotCommand("myschedule", "📋 Показать мои запланированные посты"),
-            BotCommand("calendar", "🗓️ Календарь публикаций"),
-            BotCommand("stats", "📊 Статистика публикаций"),
-            BotCommand("all_posts", "📂 Все посты в базе данных"),
-            BotCommand("publish_now", "⚡ Немедленно опубликовать пост"),
-            BotCommand("cancel", "❌ Отменить запланированный пост"),
-            BotCommand("reschedule", "🕐 Перенести публикацию"),
-            BotCommand("check_files", "🔍 Проверить загруженные файлы"),
-            BotCommand("debug", "🐛 Отладочная информация")
-        ]
-
-        await self.application.bot.set_my_commands(commands)
-        print("✅ Меню команд настроено")
-
-    async def setup_handlers(self):
-        """Настройка обработчиков"""
-        # Основные команды
+    def setup_handlers(self):
+        """Настройка обработчиков команд"""
+        # Базовые команды
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("schedule", self.schedule_command))
+        self.application.add_handler(CommandHandler("stats", self.stats_command))
         self.application.add_handler(CommandHandler("myschedule", self.myschedule_command))
         self.application.add_handler(CommandHandler("calendar", self.calendar_command))
-        self.application.add_handler(CommandHandler("stats", self.stats_command))
-        self.application.add_handler(CommandHandler("all_posts", self.all_posts_command))
         self.application.add_handler(CommandHandler("publish_now", self.publish_now_command))
-        self.application.add_handler(CommandHandler("cancel", self.cancel_command))
+
+        # Команды управления каналами
+        self.application.add_handler(CommandHandler("channels", self.channels_command))
+        self.application.add_handler(CommandHandler("add_channel", self.add_channel_command))
+        self.application.add_handler(CommandHandler("set_channel", self.set_channel_command))
+
+        # Обработчик для планирования постов
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('schedule', self.schedule_command)],
+            states={
+                SELECTING_CHANNEL: [
+                    CallbackQueryHandler(self.select_channel_callback, pattern='^channel_')
+                ],
+                SELECTING_CONTENT_TYPE: [
+                    CallbackQueryHandler(self.select_content_type_callback, pattern='^(photo|video|document|text)$')
+                ],
+                WAITING_CONTENT: [
+                    MessageHandler(filters.ALL, self.content_input_handler)
+                ],
+                WAITING_CAPTION: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.caption_input_handler),
+                    CommandHandler('skip', self.skip_caption_command)
+                ],
+                WAITING_SCHEDULE_TIME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.schedule_time_handler)
+                ]
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel_command)],
+            per_message=False
+        )
+        self.application.add_handler(conv_handler)
+
+        # Обработчики для отмены и переноса
+        self.application.add_handler(CommandHandler("cancel_post", self.cancel_post_command))
         self.application.add_handler(CommandHandler("reschedule", self.reschedule_command))
-        self.application.add_handler(CommandHandler("check_files", self.check_files_command))
-        self.application.add_handler(CommandHandler("debug", self.debug_command))
 
-        # Обработчики медиа
-        self.application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, self.handle_media_with_caption))
-        self.application.add_handler(MessageHandler(filters.VIDEO & filters.CAPTION, self.handle_media_with_caption))
-        self.application.add_handler(
-            MessageHandler(filters.Document.ALL & filters.CAPTION, self.handle_media_with_caption))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+        # Обработчик для немедленной публикации
+        self.application.add_handler(MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
+            self.publish_now_handler
+        ))
 
-    async def start_bot(self):
-        """Запуск бота"""
-        if not self.application:
-            await self.initialize()
-
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-
-        logger.info("Бот планировщика запущен")
-        print("✅ Бот успешно запущен и готов к работе!")
-        print("📋 Меню команд доступно в интерфейсе Telegram")
-
-    async def stop_bot(self):
-        """Остановка бота"""
-        if self.application:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
-
-        logger.info("Бот планировщика остановлен")
-
-    def get_user_state(self, user_id):
-        """Получение состояния пользователя"""
-        return user_states.get(user_id, {})
-
-    def set_user_state(self, user_id, state, temp_data=None):
-        """Установка состояния пользователя"""
-        user_states[user_id] = {
-            'state': state,
-            'temp_data': temp_data or {}
-        }
-
-    def clear_user_state(self, user_id):
-        """Очистка состояния пользователя"""
-        if user_id in user_states:
-            del user_states[user_id]
-
-    # КОМАНДЫ БОТА
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
+        """Команда /start - начало работы с ботом"""
         user_id = update.effective_user.id
+        user_name = update.effective_user.first_name
 
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
-            return
+        welcome_text = f"""
+🤖 <b>Добро пожаловать, {user_name}!</b>
 
-        welcome_text = """
-🤖 **Бот-планировщик публикаций для Telegram**
+Я - ваш помощник для автоматической публикации контента в Telegram каналах.
 
-✨ **Основные команды:**
-📅 /schedule - Запланировать новый пост
-📋 /myschedule - Мои запланированные посты
-🗓️ /calendar - Календарь публикаций
-📊 /stats - Статистика публикаций
+<b>📋 Основные команды:</b>
+/schedule - Запланировать новый пост
+/myschedule - Мои запланированные посты  
+/calendar - Календарь публикаций
+/stats - Статистика постов
 
-⚡ **Быстрые действия:**
-⚡ /publish_now - Немедленно опубликовать пост
-❌ /cancel - Отменить запланированный пост
-🕐 /reschedule - Перенести публикацию
+<b>📢 Управление каналами:</b>
+/channels - Мои каналы
+/add_channel - Добавить канал
+/set_channel - Выбрать активный канал
 
-🔧 **Дополнительные команды:**
-📖 /help - Полная справка по командам
-📂 /all_posts - Все посты в базе данных
-🔍 /check_files - Проверить загруженные файлы
-🐛 /debug - Отладочная информация
+<b>⚡ Быстрые действия:</b>
+/publish_now - Немедленная публикация
+/cancel_post - Отмена поста
+/reschedule - Перенос публикации
 
-🌟 **Автоформатирование:**
-• Эмодзи для каждого абзаца
-• Автоматические хештеги из текста
-• Красивое оформление
-
-💡 **Быстрый старт:**
-1. Используйте /schedule
-2. Отправьте контент (фото, видео, документ или текст)
-3. Укажите дату и время публикации
+Для начала работы добавьте канал с помощью /add_channel и установите его активным с помощью /set_channel.
         """
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
-        self.clear_user_state(user_id)
+
+        await update.message.reply_text(welcome_text, parse_mode='HTML')
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /help"""
+        """Команда /help - справка по командам"""
         help_text = """
-📖 **Помощь по использованию планировщика**
+<b>📖 Справка по командам:</b>
 
-**📅 Основные команды:**
-• /schedule - Запланировать новый пост
-• /myschedule - Мои запланированные посты  
-• /calendar - Календарь публикаций
-• /stats - Статистика публикаций
+<b>📋 Основные команды:</b>
+/start - Начало работы
+/help - Эта справка
+/schedule - Запланировать новый пост
+/myschedule - Мои запланированные посты (7 дней)
+/calendar - Календарь публикаций (30 дней)
+/stats - Статистика постов
 
-**⚡ Быстрые действия:**
-• /publish_now ID - Немедленно опубликовать пост
-• /cancel ID - Отменить запланированный пост
-• /reschedule ID ВРЕМЯ - Перенести публикацию
+<b>📢 Управление каналами:</b>
+/channels - Список моих каналов
+/add_channel - Добавить новый канал
+/set_channel - Выбрать активный канал
 
-**🔧 Дополнительные команды:**
-• /all_posts - Все посты в базе данных
-• /check_files - Проверить загруженные файлы
-• /debug - Отладочная информация
+<b>⚡ Быстрые действия:</b>
+/publish_now - Немедленная публикация
+/cancel_post - Отмена запланированного поста
+/reschedule - Перенос времени публикации
 
-**⏰ Форматы даты и времени:**
-• `15:30` - сегодня в 15:30
-• `18:00 25.12` - 25 декабря в 18:00
-• `+2h` - через 2 часа
-• `+1d` - через 1 день
-• `tomorrow 14:00` - завтра в 14:00
-
-**📄 Поддерживаемые типы контента:**
-• 📷 Фотографии (с подписью)
-• 🎥 Видео (с подписью)
-• 📄 Документы (с подписью)
-• 📝 Текстовые сообщения
-
-**🌟 Автоформатирование:**
-Текст автоматически форматируется:
-• Добавляются эмодзи к абзацам
-• Извлекаются хештеги из текста
-• Добавляются релевантные хештеги
-
-**💡 Примеры использования:**
-• `/schedule` - начать планирование
-• `/cancel 5` - отменить пост с ID 5
-• `/reschedule 5 18:00` - перенести пост 5 на 18:00
-• `/publish_now 5` - немедленно опубликовать пост 5
+<b>💡 Как использовать:</b>
+1. Добавьте канал командой /add_channel
+2. Установите активный канал /set_channel
+3. Планируйте посты командой /schedule
+4. Следите за расписанием через /myschedule
         """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        await update.message.reply_text(help_text, parse_mode='HTML')
+
+    async def channels_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /channels - список каналов пользователя"""
+        user_id = update.effective_user.id
+
+        channels = db.get_user_channels(user_id)
+        active_channel = db.get_active_channel(user_id)
+
+        if not channels:
+            await update.message.reply_text(
+                "📢 У вас пока нет добавленных каналов.\n\n"
+                "Добавьте канал с помощью команды /add_channel"
+            )
+            return
+
+        channels_text = "📢 <b>Ваши каналы:</b>\n\n"
+        for i, channel in enumerate(channels, 1):
+            status = "✅ АКТИВЕН" if channel['channel_id'] == active_channel else "⚪"
+            channels_text += f"{i}. {channel['channel_name']} ({channel['channel_id']}) {status}\n"
+
+        channels_text += f"\nИспользуйте /set_channel для выбора активного канала."
+
+        await update.message.reply_text(channels_text, parse_mode='HTML')
+
+    async def add_channel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /add_channel - добавление нового канала"""
+        user_id = update.effective_user.id
+        args = context.args
+
+        if not args:
+            await update.message.reply_text(
+                "📝 <b>Добавление канала</b>\n\n"
+                "Использование: /add_channel @username_канала \"Название канала\"\n\n"
+                "Пример:\n"
+                "<code>/add_channel @my_channel \"Мой Техно Блог\"</code>",
+                parse_mode='HTML'
+            )
+            return
+
+        if len(args) < 2:
+            await update.message.reply_text("❌ Пожалуйста, укажите username канала и название в кавычках.")
+            return
+
+        channel_id = args[0]
+        channel_name = ' '.join(args[1:]).strip('"')
+
+        # Проверяем формат channel_id
+        if not channel_id.startswith('@'):
+            channel_id = '@' + channel_id
+
+        # Проверяем, что бот является администратором в канале
+        try:
+            bot = context.bot
+            chat = await bot.get_chat(channel_id)
+
+            # Проверяем права бота
+            chat_member = await bot.get_chat_member(chat.id, bot.id)
+            if chat_member.status not in ['administrator', 'creator']:
+                await update.message.reply_text(
+                    "❌ Бот не является администратором в указанном канале.\n\n"
+                    "Пожалуйста, добавьте бота как администратора с правом публикации сообщений."
+                )
+                return
+
+            # Добавляем канал в базу
+            success = db.add_user_channel(user_id, channel_id, channel_name)
+
+            if success:
+                # Устанавливаем этот канал как активный по умолчанию
+                db.set_active_channel(user_id, channel_id)
+
+                await update.message.reply_text(
+                    f"✅ Канал <b>{channel_name}</b> ({channel_id}) успешно добавлен и установлен как активный!\n\n"
+                    f"Теперь вы можете планировать посты для этого канала.",
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text("❌ Ошибка при добавлении канала.")
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Ошибка при добавлении канала: {str(e)}\n\n"
+                f"Убедитесь, что:\n"
+                f"• Канал существует\n"
+                f"• Бот добавлен как администратор\n"
+                f"• Username канала указан правильно"
+            )
+
+    async def set_channel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /set_channel - выбор активного канала"""
+        user_id = update.effective_user.id
+        args = context.args
+
+        channels = db.get_user_channels(user_id)
+
+        if not channels:
+            await update.message.reply_text(
+                "❌ У вас нет добавленных каналов.\n\n"
+                "Добавьте канал с помощью /add_channel"
+            )
+            return
+
+        if not args:
+            # Показываем список каналов для выбора
+            keyboard = []
+            for channel in channels:
+                keyboard.append([InlineKeyboardButton(
+                    f"{channel['channel_name']} ({channel['channel_id']})",
+                    callback_data=f"channel_{channel['channel_id']}"
+                )])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "📢 <b>Выберите активный канал:</b>",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+            return
+
+        # Если передан аргумент
+        channel_id = args[0]
+        if not channel_id.startswith('@'):
+            channel_id = '@' + channel_id
+
+        # Проверяем, что канал принадлежит пользователю
+        user_channels = [ch['channel_id'] for ch in channels]
+        if channel_id not in user_channels:
+            await update.message.reply_text("❌ Этот канал не найден в вашем списке каналов.")
+            return
+
+        # Устанавливаем активный канал
+        success = db.set_active_channel(user_id, channel_id)
+        if success:
+            channel_name = next(ch['channel_name'] for ch in channels if ch['channel_id'] == channel_id)
+            await update.message.reply_text(
+                f"✅ Активный канал изменен на: <b>{channel_name}</b> ({channel_id})",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка при установке активного канала.")
 
     async def schedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса планирования"""
+        """Команда /schedule - начало процесса планирования"""
         user_id = update.effective_user.id
+        print(f"DEBUG: 🚀 Начало планирования для пользователя {user_id}")
 
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
+        # Проверяем наличие каналов
+        channels = db.get_user_channels(user_id)
+        if not channels:
+            await update.message.reply_text(
+                "❌ У вас нет добавленных каналов.\n\n"
+                "Добавьте канал с помощью /add_channel перед планированием постов."
+            )
+            return ConversationHandler.END
 
-        self.set_user_state(user_id, 'waiting_for_content')
+        active_channel = db.get_active_channel(user_id)
+        print(f"DEBUG: 📢 Активный канал: {active_channel}")
 
-        await update.message.reply_text(
-            "📝 **Режим планирования**\n\n"
-            "Отправьте мне контент для публикации:\n"
-            "- 📷 Фото с подписью\n"
-            "- 🎥 Видео с подписью\n"
-            "- 📄 Документ с подписью\n"
-            "- 📝 Текст сообщения\n\n"
-            "После загрузки контента я запрошу дату и время публикации.",
-            parse_mode='Markdown'
+        if not active_channel:
+            # Если нет активного канала, просим выбрать
+            print(f"DEBUG: 🔄 Нет активного канала, показываем выбор")
+            keyboard = []
+            for channel in channels:
+                keyboard.append([InlineKeyboardButton(
+                    f"{channel['channel_name']} ({channel['channel_id']})",
+                    callback_data=f"channel_{channel['channel_id']}"
+                )])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "📢 <b>Выберите канал для публикации:</b>",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+            return SELECTING_CHANNEL
+        else:
+            # Если есть активный канал, показываем выбор типа контента
+            channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == active_channel),
+                                active_channel)
+            print(f"DEBUG: 📋 Показываем выбор типа контента для канала {channel_name}")
+
+            keyboard = [
+                [InlineKeyboardButton("📷 Фото", callback_data='photo')],
+                [InlineKeyboardButton("🎥 Видео", callback_data='video')],
+                [InlineKeyboardButton("📄 Документ", callback_data='document')],
+                [InlineKeyboardButton("📝 Текст", callback_data='text')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                f"📋 <b>Выберите тип контента для публикации в {channel_name}:</b>",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+            return SELECTING_CONTENT_TYPE
+
+    async def select_channel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик выбора канала"""
+        query = update.callback_query
+        await query.answer()
+
+        channel_id = query.data.replace('channel_', '')
+        user_id = query.from_user.id
+
+        print(f"DEBUG: ✅ Выбран канал {channel_id} для пользователя {user_id}")
+
+        # Устанавливаем активный канал
+        success = db.set_active_channel(user_id, channel_id)
+
+        if success:
+            # Получаем название канала
+            channels = db.get_user_channels(user_id)
+            channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == channel_id), channel_id)
+
+            await query.edit_message_text(
+                f"✅ Активный канал: <b>{channel_name}</b> ({channel_id})\n\n"
+                f"Теперь выберите тип контента:",
+                parse_mode='HTML'
+            )
+
+            # Показываем выбор типа контента
+            keyboard = [
+                [InlineKeyboardButton("📷 Фото", callback_data='photo')],
+                [InlineKeyboardButton("🎥 Видео", callback_data='video')],
+                [InlineKeyboardButton("📄 Документ", callback_data='document')],
+                [InlineKeyboardButton("📝 Текст", callback_data='text')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.message.reply_text(
+                "📋 <b>Выберите тип контента:</b>",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+
+            return SELECTING_CONTENT_TYPE
+        else:
+            await query.edit_message_text("❌ Ошибка при выборе канала.")
+            return ConversationHandler.END
+
+    async def select_content_type_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик выбора типа контента"""
+        query = update.callback_query
+        await query.answer()
+
+        content_type = query.data
+        context.user_data['content_type'] = content_type
+
+        print(f"DEBUG: 📋 Выбран тип контента: {content_type}")
+
+        content_type_names = {
+            'photo': '📷 фото',
+            'video': '🎥 видео',
+            'document': '📄 документ',
+            'text': '📝 текст'
+        }
+
+        await query.edit_message_text(
+            f"✅ Выбран тип: <b>{content_type_names[content_type]}</b>\n\n"
+            f"Теперь отправьте {'текст' if content_type == 'text' else 'файл'} для публикации:",
+            parse_mode='HTML'
         )
 
-    async def handle_media_with_caption(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка медиа с подписью"""
-        user_id = update.effective_user.id
+        return WAITING_CONTENT
 
-        if user_id not in ADMIN_IDS:
+    async def content_input_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ввода контента"""
+        user_id = update.effective_user.id
+        content_type = context.user_data.get('content_type')
+
+        print(f"DEBUG: 📥 Получен контент типа {content_type}")
+
+        try:
+            if content_type == 'text':
+                # Для текстовых постов
+                text_content = update.message.text
+                print(f"DEBUG: 📝 Текстовый контент: {text_content[:100]}...")
+                file_path = content_manager.save_text_content(text_content)
+                context.user_data['file_path'] = file_path
+
+                await update.message.reply_text(
+                    "📝 Теперь введите подпись к посту (или отправьте /skip чтобы пропустить):"
+                )
+                return WAITING_CAPTION
+
+            else:
+                # Для файловых постов
+                if content_type == 'photo' and update.message.photo:
+                    file_data = update.message.photo[-1].get_file()
+                    print(f"DEBUG: 📷 Получено фото")
+                elif content_type == 'video' and update.message.video:
+                    file_data = update.message.video.get_file()
+                    print(f"DEBUG: 🎥 Получено видео")
+                elif content_type == 'document' and update.message.document:
+                    file_data = update.message.document.get_file()
+                    print(f"DEBUG: 📄 Получен документ")
+                else:
+                    await update.message.reply_text(
+                        f"❌ Пожалуйста, отправьте {'текст' if content_type == 'text' else content_type}"
+                    )
+                    return WAITING_CONTENT
+
+                # Сохраняем файл с использованием await для file_data
+                file_path = await content_manager.save_file(content_type, file_data)
+                context.user_data['file_path'] = file_path
+
+                await update.message.reply_text(
+                    "📝 Теперь введите подпись к посту (или отправьте /skip чтобы пропустить):"
+                )
+                return WAITING_CAPTION
+
+        except Exception as e:
+            print(f"DEBUG: ❌ Ошибка при обработке контента: {str(e)}")
+            await update.message.reply_text(f"❌ Ошибка при обработке контента: {str(e)}")
+            return ConversationHandler.END
+
+
+    async def caption_input_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ввода подписи"""
+        caption = update.message.text
+        print(f"DEBUG: 📝 Получена подпись: {caption}")
+
+        context.user_data['caption'] = caption
+
+        await update.message.reply_text(
+            "⏰ Теперь укажите время публикации в формате:\n\n"
+            "<code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n\n"
+            "Примеры:\n"
+            "<code>2024-12-31 20:00</code> - 31 декабря в 20:00\n"
+            "<code>20:00</code> - сегодня в 20:00\n"
+            "<code>+2 hours</code> - через 2 часа\n"
+            "<code>tomorrow 14:00</code> - завтра в 14:00",
+            parse_mode='HTML'
+        )
+
+        return WAITING_SCHEDULE_TIME
+
+    async def skip_caption_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /skip для пропуска подписи"""
+        print(f"DEBUG: ⏩ Пропуск подписи")
+        context.user_data['caption'] = ""
+
+        await update.message.reply_text(
+            "⏰ Теперь укажите время публикации в формате:\n\n"
+            "<code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n\n"
+            "Примеры:\n"
+            "<code>2024-12-31 20:00</code> - 31 декабря в 20:00\n"
+            "<code>20:00</code> - сегодня в 20:00\n"
+            "<code>+2 hours</code> - через 2 часа\n"
+            "<code>tomorrow 14:00</code> - завтра в 14:00",
+            parse_mode='HTML'
+        )
+
+        return WAITING_SCHEDULE_TIME
+
+    async def schedule_time_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ввода времени публикации"""
+        user_id = update.effective_user.id
+        time_input = update.message.text
+        active_channel = db.get_active_channel(user_id)
+
+        print(f"DEBUG: ⏰ Введено время: {time_input}")
+
+        try:
+            # Парсим время
+            scheduled_time = self.parse_time_input(time_input)
+
+            if scheduled_time <= datetime.now():
+                await update.message.reply_text("❌ Время публикации должно быть в будущем!")
+                return WAITING_SCHEDULE_TIME
+
+            # Сохраняем пост в базу
+            post_id = db.add_scheduled_post(
+                user_id=user_id,
+                channel_id=active_channel,
+                content_type=context.user_data['content_type'],
+                file_path=context.user_data['file_path'],
+                caption=context.user_data.get('caption', ''),
+                scheduled_time=scheduled_time
+            )
+
+            if post_id:
+                channels = db.get_user_channels(user_id)
+                channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == active_channel),
+                                    active_channel)
+
+                await update.message.reply_text(
+                    f"✅ Пост успешно запланирован!\n\n"
+                    f"📅 <b>Канал:</b> {channel_name}\n"
+                    f"⏰ <b>Время:</b> {scheduled_time.strftime('%d.%m.%Y в %H:%M')}\n"
+                    f"📋 <b>Тип:</b> {context.user_data['content_type']}\n"
+                    f"🆔 <b>ID поста:</b> {post_id}",
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text("❌ Ошибка при сохранении поста в базу данных.")
+
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Неверный формат времени: {str(e)}")
+            return WAITING_SCHEDULE_TIME
+        except Exception as e:
+            print(f"DEBUG: ❌ Ошибка при планировании: {str(e)}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+        return ConversationHandler.END
+
+    def parse_time_input(self, time_input):
+        """Парсинг времени"""
+        time_input = time_input.strip().lower()
+        now = datetime.now()
+
+        print(f"DEBUG: ⏳ Парсим время: {time_input}")
+
+        try:
+            # Формат: ГГГГ-ММ-ДД ЧЧ:ММ
+            if '-' in time_input and ':' in time_input:
+                return datetime.strptime(time_input, '%Y-%m-%d %H:%M')
+
+            # Формат: ЧЧ:ММ (сегодня)
+            elif ':' in time_input and len(time_input) <= 5:
+                time_part = datetime.strptime(time_input, '%H:%M').time()
+                result = datetime.combine(now.date(), time_part)
+                # Если время уже прошло сегодня, планируем на завтра
+                if result <= now:
+                    result += timedelta(days=1)
+                return result
+
+            # Относительное время: +N hours/minutes/days
+            elif time_input.startswith('+'):
+                parts = time_input[1:].split()
+                if len(parts) == 2:
+                    amount = int(parts[0])
+                    unit = parts[1].lower()
+
+                    if 'hour' in unit:
+                        return now + timedelta(hours=amount)
+                    elif 'minute' in unit:
+                        return now + timedelta(minutes=amount)
+                    elif 'day' in unit:
+                        return now + timedelta(days=amount)
+                    else:
+                        raise ValueError("Неизвестная единица времени")
+                else:
+                    raise ValueError("Неверный формат относительного времени")
+
+            # Завтра в ЧЧ:ММ
+            elif time_input.startswith('tomorrow'):
+                parts = time_input.split()
+                if len(parts) == 2 and ':' in parts[1]:
+                    time_part = datetime.strptime(parts[1], '%H:%M').time()
+                    return datetime.combine(now.date() + timedelta(days=1), time_part)
+                else:
+                    raise ValueError("Неверный формат времени для 'tomorrow'")
+
+            else:
+                raise ValueError("Неизвестный формат времени")
+
+        except Exception as e:
+            raise ValueError(f"Не удалось распознать время: {str(e)}")
+
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда отмены диалога"""
+        print(f"DEBUG: ❌ Отмена операции")
+        await update.message.reply_text("❌ Операция отменена.")
+        return ConversationHandler.END
+
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /stats - статистика постов"""
+        user_id = update.effective_user.id
+        active_channel = db.get_active_channel(user_id)
+
+        if active_channel:
+            stats = db.get_post_stats(user_id, active_channel)
+            channels = db.get_user_channels(user_id)
+            channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == active_channel),
+                                active_channel)
+
+            stats_text = f"""
+📊 <b>Статистика для канала {channel_name}:</b>
+
+📝 Всего постов: {stats['total']}
+⏳ Запланировано: {stats['scheduled']}
+✅ Опубликовано: {stats['published']}
+❌ Отменено: {stats['cancelled']}
+            """
+        else:
+            stats = db.get_post_stats(user_id)
+
+            stats_text = f"""
+📊 <b>Общая статистика по всем каналам:</b>
+
+📝 Всего постов: {stats['total']}
+⏳ Запланировано: {stats['scheduled']}
+✅ Опубликовано: {stats['published']}
+❌ Отменено: {stats['cancelled']}
+            """
+
+        await update.message.reply_text(stats_text, parse_mode='HTML')
+
+    async def myschedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /myschedule - мои запланированные посты"""
+        user_id = update.effective_user.id
+        active_channel = db.get_active_channel(user_id)
+
+        if active_channel:
+            schedule = db.get_user_schedule(user_id, active_channel, days=7)
+            channels = db.get_user_channels(user_id)
+            channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == active_channel),
+                                active_channel)
+
+            if not schedule:
+                await update.message.reply_text(
+                    f"📅 У вас нет запланированных постов для канала <b>{channel_name}</b> на ближайшие 7 дней.",
+                    parse_mode='HTML'
+                )
+                return
+
+            schedule_text = f"📅 <b>Ваше расписание для {channel_name} (7 дней):</b>\n\n"
+        else:
+            schedule = db.get_user_schedule(user_id, days=7)
+
+            if not schedule:
+                await update.message.reply_text(
+                    "📅 У вас нет запланированных постов на ближайшие 7 дней."
+                )
+                return
+
+            schedule_text = "📅 <b>Ваше расписание по всем каналам (7 дней):</b>\n\n"
+
+        for i, post in enumerate(schedule, 1):
+            post_time = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S')
+            schedule_text += (
+                f"{i}. <b>ID:{post['id']}</b> | {post_time.strftime('%d.%m %H:%M')}\n"
+                f"   📋 {post['content_type']} | {post['caption'][:50]}{'...' if len(post['caption']) > 50 else ''}\n"
+            )
+
+            if not active_channel:
+                schedule_text += f"   📢 {post['channel_id']}\n"
+
+            schedule_text += "\n"
+
+        await update.message.reply_text(schedule_text, parse_mode='HTML')
+
+    async def calendar_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /calendar - календарь публикаций"""
+        user_id = update.effective_user.id
+        active_channel = db.get_active_channel(user_id)
+
+        if active_channel:
+            schedule = db.get_user_schedule(user_id, active_channel, days=30)
+            channels = db.get_user_channels(user_id)
+            channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == active_channel),
+                                active_channel)
+
+            if not schedule:
+                await update.message.reply_text(
+                    f"📅 У вас нет запланированных постов для канала <b>{channel_name}</b> на ближайшие 30 дней.",
+                    parse_mode='HTML'
+                )
+                return
+
+            calendar_text = f"📅 <b>Календарь публикаций для {channel_name} (30 дней):</b>\n\n"
+        else:
+            schedule = db.get_user_schedule(user_id, days=30)
+
+            if not schedule:
+                await update.message.reply_text(
+                    "📅 У вас нет запланированных постов на ближайшие 30 дней."
+                )
+                return
+
+            calendar_text = "📅 <b>Календарь публикаций по всем каналам (30 дней):</b>\n\n"
+
+        # Группируем по дням
+        posts_by_day = {}
+        for post in schedule:
+            post_time = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S')
+            day_key = post_time.strftime('%Y-%m-%d')
+            if day_key not in posts_by_day:
+                posts_by_day[day_key] = []
+            posts_by_day[day_key].append(post)
+
+        for day in sorted(posts_by_day.keys()):
+            day_date = datetime.strptime(day, '%Y-%m-%d')
+            calendar_text += f"<b>📅 {day_date.strftime('%d.%m.%Y')}:</b>\n"
+
+            for post in posts_by_day[day]:
+                post_time = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S')
+                calendar_text += (
+                    f"   🕐 {post_time.strftime('%H:%M')} | "
+                    f"<b>ID:{post['id']}</b> | {post['content_type']}\n"
+                )
+
+            calendar_text += "\n"
+
+        await update.message.reply_text(calendar_text, parse_mode='HTML')
+
+    async def publish_now_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /publish_now - немедленная публикация"""
+        user_id = update.effective_user.id
+        active_channel = db.get_active_channel(user_id)
+
+        if not active_channel:
+            await update.message.reply_text(
+                "❌ У вас нет активного канала.\n\n"
+                "Используйте /set_channel чтобы выбрать канал для публикации."
+            )
             return
 
-        user_state = self.get_user_state(user_id)
+        context.user_data['publish_now'] = True
+        await update.message.reply_text(
+            "🚀 <b>Немедленная публикация</b>\n\n"
+            "Отправьте контент для публикации (фото, видео, документ или текст).\n"
+            "Пост будет опубликован сразу после получения.",
+            parse_mode='HTML'
+        )
 
-        if user_state.get('state') != 'waiting_for_content':
-            # Если не в режиме планирования, предлагаем начать
-            await update.message.reply_text(
-                "💡 Чтобы запланировать этот контент, сначала используйте /schedule"
-            )
+    async def publish_now_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик немедленной публикации"""
+        if not context.user_data.get('publish_now'):
+            return
+
+        user_id = update.effective_user.id
+        active_channel = db.get_active_channel(user_id)
+
+        if not active_channel:
+            await update.message.reply_text("❌ Нет активного канала.")
             return
 
         try:
             # Определяем тип контента
             if update.message.photo:
                 content_type = 'photo'
-                file = await update.message.photo[-1].get_file()
-                file_name = f"photo_{int(datetime.now().timestamp())}.jpg"
+                file_data = update.message.photo[-1].get_file()
+                caption = update.message.caption or ""
             elif update.message.video:
                 content_type = 'video'
-                file = await update.message.video.get_file()
-                file_name = f"video_{int(datetime.now().timestamp())}.mp4"
-            else:  # document
+                file_data = update.message.video.get_file()
+                caption = update.message.caption or ""
+            elif update.message.document:
                 content_type = 'document'
-                file = await update.message.document.get_file()
-                file_name = update.message.document.file_name or f"document_{int(datetime.now().timestamp())}"
+                file_data = update.message.document.get_file()
+                caption = update.message.caption or ""
+            elif update.message.text:
+                content_type = 'text'
+                text_content = update.message.text
+                caption = ""
+            else:
+                await update.message.reply_text("❌ Неподдерживаемый тип контента.")
+                return
 
-            print(f"DEBUG: Сохраняем {content_type} файл: {file_name}")
+            # Сохраняем контент
+            if content_type == 'text':
+                file_path = content_manager.save_text_content(text_content)
+            else:
+                file_path = await content_manager.save_file(content_type, file_data)
 
-            # Сохраняем файл (АСИНХРОННО!)
-            file_path = await content_manager.save_file(content_type, file, file_name)
-            caption = update.message.caption
-
-            print(f"DEBUG: Файл сохранен: {file_path}")
-            print(f"DEBUG: Подпись: {caption}")
-
-            # Сохраняем временные данные
-            self.set_user_state(user_id, 'waiting_for_schedule', {
+            # Публикуем пост
+            post = {
+                'channel_id': active_channel,
                 'content_type': content_type,
                 'file_path': file_path,
                 'caption': caption
-            })
-
-            await update.message.reply_text(
-                f"✅ **{content_type.upper()} сохранен!**\n\n"
-                f"Теперь укажите время публикации:\n\n"
-                f"**Примеры:**\n"
-                f"• `15:30` - сегодня в 15:30\n"
-                f"• `18:00 25.12` - 25 декабря\n"
-                f"• `+2h` - через 2 часа\n"
-                f"• `tomorrow 14:00` - завтра в 14:00\n\n"
-                f"Отправьте время в любом из этих форматов:",
-                parse_mode='Markdown'
-            )
-
-        except Exception as e:
-            print(f"DEBUG: Ошибка обработки медиа: {e}")
-            await update.message.reply_text("❌ Ошибка обработки медиа. Попробуйте снова.")
-            self.clear_user_state(user_id)
-
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка всех текстовых сообщений"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            return
-
-        user_state = self.get_user_state(user_id)
-        text = update.message.text
-
-        print(f"DEBUG: Получен текст от {user_id}: '{text}'")
-        print(f"DEBUG: Состояние пользователя: {user_state}")
-
-        # Если пользователь в состоянии ожидания времени
-        if user_state.get('state') == 'waiting_for_schedule':
-            await self.process_schedule_time(update, text, user_state)
-        elif user_state.get('state') == 'waiting_for_content':
-            # Если пользователь отправил текст вместо медиа
-            await self.handle_text_content(update, text)
-        else:
-            # Обычное текстовое сообщение
-            await update.message.reply_text(
-                "💡 Чтобы запланировать пост, используйте /schedule"
-            )
-
-    async def handle_text_content(self, update: Update, text):
-        """Обработка текстового контента для планирования"""
-        user_id = update.effective_user.id
-
-        try:
-            print(f"DEBUG: Сохраняем текстовый контент: {text[:50]}...")
-
-            # Сохраняем текст в файл
-            file_path = content_manager.save_text_content(text)
-
-            print(f"DEBUG: Текст сохранен в: {file_path}")
-
-            # Сохраняем временные данные
-            self.set_user_state(user_id, 'waiting_for_schedule', {
-                'content_type': 'text',
-                'file_path': file_path,
-                'caption': text
-            })
-
-            await update.message.reply_text(
-                "✅ **Текст сохранен!**\n\n"
-                "Теперь укажите время публикации:\n\n"
-                "**Примеры:**\n"
-                "• `15:30` - сегодня в 15:30\n"
-                "• `18:00 25.12` - 25 декабря\n"
-                "• `+2h` - через 2 часа\n"
-                "• `tomorrow 14:00` - завтра в 14:00\n\n"
-                "Отправьте время в любом из этих форматов:",
-                parse_mode='Markdown'
-            )
-
-        except Exception as e:
-            print(f"DEBUG: Ошибка сохранения текста: {e}")
-            await update.message.reply_text("❌ Ошибка сохранения текста. Попробуйте снова.")
-            self.clear_user_state(user_id)
-
-    async def process_schedule_time(self, update: Update, time_input, user_state):
-        """Обработка времени публикации"""
-        user_id = update.effective_user.id
-
-        try:
-            print(f"DEBUG: Обрабатываем время: '{time_input}'")
-
-            scheduled_time = self.parse_time_input(time_input)
-
-            if not scheduled_time:
-                await update.message.reply_text(
-                    "❌ Неверный формат времени.\n\n"
-                    "**Попробуйте так:**\n"
-                    "• 15:30\n"
-                    "• 18:00 25.12\n"
-                    "• +2h\n"
-                    "• tomorrow 14:00\n\n"
-                    "Отправьте время еще раз:",
-                    parse_mode='Markdown'
-                )
-                return
-
-            # Проверяем что время в будущем
-            if scheduled_time <= datetime.now():
-                await update.message.reply_text(
-                    "❌ Время публикации должно быть в будущем!\n"
-                    "Укажите более позднее время:"
-                )
-                return
-
-            print(f"DEBUG: Время распознано: {scheduled_time}")
-
-            # Сохраняем запланированный пост
-            post_id = db.add_scheduled_post(
-                user_id=user_id,
-                content_type=user_state['temp_data']['content_type'],
-                file_path=user_state['temp_data']['file_path'],
-                caption=user_state['temp_data']['caption'],
-                scheduled_time=scheduled_time
-            )
-
-            if post_id is None:
-                await update.message.reply_text(
-                    "❌ Ошибка сохранения поста в базу данных. Попробуйте снова."
-                )
-                return
-
-            # Очищаем состояние
-            self.clear_user_state(user_id)
-
-            await update.message.reply_text(
-                f"✅ **Пост успешно запланирован!**\n\n"
-                f"📅 ID: {post_id}\n"
-                f"⏰ Время: {scheduled_time.strftime('%d.%m.%Y %H:%M')}\n"
-                f"📋 Тип: {user_state['temp_data']['content_type']}\n\n"
-                f"🌟 *Текст будет автоматически отформатирован:*\n"
-                f"• Добавлены эмодзи к абзацам\n"
-                f"• Извлечены хештеги из текста\n"
-                f"• Добавлены релевантные хештеги\n\n"
-                f"Пост будет автоматически опубликован в указанное время.",
-                parse_mode='Markdown'
-            )
-
-            print(f"DEBUG: Пост {post_id} успешно запланирован")
-
-        except Exception as e:
-            print(f"DEBUG: Критическая ошибка в process_schedule_time: {e}")
-            await update.message.reply_text("❌ Критическая ошибка. Начните заново с /schedule")
-            self.clear_user_state(user_id)
-
-    def parse_time_input(self, time_input):
-        """Парсинг ввода времени"""
-        time_input = time_input.lower().strip()
-        now = datetime.now()
-
-        try:
-            # Формат: 15:30
-            if re.match(r'^\d{1,2}:\d{2}$', time_input):
-                hours, minutes = map(int, time_input.split(':'))
-                scheduled = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
-                if scheduled <= now:
-                    scheduled += timedelta(days=1)
-                return scheduled
-
-            # Формат: 18:00 25.12
-            match = re.match(r'^(\d{1,2}:\d{2})\s+(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$', time_input)
-            if match:
-                time_part, day, month, year = match.groups()
-                hours, minutes = map(int, time_part.split(':'))
-                year = int(year) if year else now.year
-                month = int(month)
-                day = int(day)
-                return datetime(year, month, day, hours, minutes, 0)
-
-            # Формат: +2h, +30m
-            match = re.match(r'^\+(\d+)([hmd])$', time_input)
-            if match:
-                value, unit = int(match.group(1)), match.group(2)
-                if unit == 'h':
-                    return now + timedelta(hours=value)
-                elif unit == 'm':
-                    return now + timedelta(minutes=value)
-                elif unit == 'd':
-                    return now + timedelta(days=value)
-
-            # Формат: tomorrow 14:00
-            if time_input.startswith('tomorrow'):
-                time_part = time_input.replace('tomorrow', '').strip()
-                if re.match(r'^\d{1,2}:\d{2}$', time_part):
-                    hours, minutes = map(int, time_part.split(':'))
-                    scheduled = (now + timedelta(days=1)).replace(hour=hours, minute=minutes, second=0, microsecond=0)
-                    return scheduled
-
-            # Формат: YYYY-MM-DD HH:MM
-            try:
-                return datetime.strptime(time_input, '%Y-%m-%d %H:%M')
-            except ValueError:
-                pass
-
-        except Exception:
-            pass
-
-        return None
-
-    async def calendar_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать календарь публикаций"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-
-        try:
-            schedule = db.get_user_schedule(user_id, days=14)  # 2 недели
-
-            if not schedule:
-                await update.message.reply_text(
-                    "📅 На ближайшие 2 недели нет запланированных публикаций.\n\n"
-                    "Используйте /schedule чтобы запланировать первый пост!"
-                )
-                return
-
-            calendar_text = "🗓️ **Календарь публикаций (14 дней):**\n\n"
-
-            current_date = None
-            for post in schedule:
-                post_time = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S')
-                post_date = post_time.date()
-
-                if post_date != current_date:
-                    current_date = post_date
-                    calendar_text += f"\n**{current_date.strftime('%d.%m.%Y')}:**\n"
-
-                emoji = self.get_media_emoji(post['content_type'])
-                time_str = post_time.strftime('%H:%M')
-                preview = post['caption'][:30] + "..." if post['caption'] and len(post['caption']) > 30 else post[
-                                                                                                                 'caption'] or 'без подписи'
-
-                calendar_text += f"{emoji} `{time_str}` ID:{post['id']} {preview}\n"
-
-            await update.message.reply_text(calendar_text, parse_mode='Markdown')
-
-        except Exception as e:
-            logger.error(f"Ошибка календаря: {e}")
-            await update.message.reply_text("❌ Ошибка загрузки календаря")
-
-    async def myschedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Мои запланированные посты"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-
-        try:
-            schedule = db.get_user_schedule(user_id, days=30)
-            stats = db.get_post_stats(user_id)
-
-            if not schedule:
-                await update.message.reply_text(
-                    "📭 Нет запланированных публикаций.\n\n"
-                    "💡 Используйте /schedule чтобы запланировать первый пост!"
-                )
-                return
-
-            schedule_text = f"""
-📋 **Мои запланированные публикации:**
-
-📊 Статистика:
-✅ Опубликовано: {stats['published']}
-⏳ Запланировано: {stats['scheduled']}
-❌ Отменено: {stats['cancelled']}
-
-**Ближайшие посты:**
-"""
-
-            for post in schedule[:10]:  # Показываем первые 10
-                emoji = self.get_media_emoji(post['content_type'])
-                time = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S').strftime('%d.%m %H:%M')
-                preview = post['caption'][:40] + "..." if post['caption'] and len(post['caption']) > 40 else post[
-                                                                                                                 'caption'] or 'без подписи'
-
-                schedule_text += f"\n{emoji} `ID:{post['id']}` {time}\n   {preview}\n"
-
-            if len(schedule) > 10:
-                schedule_text += f"\n... и еще {len(schedule) - 10} постов"
-
-            schedule_text += "\n\nℹ️ Используйте /cancel ID для отмены"
-
-            await update.message.reply_text(schedule_text, parse_mode='Markdown')
-
-        except Exception as e:
-            logger.error(f"Ошибка расписания: {e}")
-            await update.message.reply_text("❌ Ошибка загрузки расписания")
-
-    async def all_posts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать все посты в БД"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            return
-
-        try:
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-
-            # Получаем ВСЕ посты
-            cursor.execute('SELECT * FROM scheduled_posts ORDER BY id DESC')
-            all_posts = cursor.fetchall()
-            conn.close()
-
-            response = f"📂 **Все посты в БД:** {len(all_posts)} записей\n\n"
-
-            for post in all_posts:
-                status_emoji = "✅" if post[6] == 'published' else "⏳" if post[6] == 'scheduled' else "❌"
-                response += f"{status_emoji} **ID:{post[0]}** - {post[2]} - {post[6]}\n"
-                response += f"   ⏰ {post[5]}\n"
-                response += f"   💬 Message ID: {post[8] or 'нет'}\n"
-                response += f"   📝 {post[4][:30] + '...' if post[4] and len(post[4]) > 30 else post[4] or 'нет подписи'}\n\n"
-
-            if not all_posts:
-                response = "📭 База данных пуста"
-
-            await update.message.reply_text(response, parse_mode='Markdown')
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-
-    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена запланированного поста"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-
-        if not context.args:
-            await update.message.reply_text(
-                "❌ Укажите ID поста: /cancel 123\n\n"
-                "ID можно посмотреть в /myschedule"
-            )
-            return
-
-        try:
-            post_id = int(context.args[0])
-
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-
-            cursor.execute('''
-                UPDATE scheduled_posts 
-                SET status = 'cancelled'
-                WHERE id = ? AND user_id = ? AND status = 'scheduled'
-            ''', (post_id, user_id))
-
-            affected = cursor.rowcount
-            conn.commit()
-            conn.close()
-
-            if affected > 0:
-                await update.message.reply_text(f"✅ Пост ID:{post_id} отменен")
-            else:
-                await update.message.reply_text(
-                    f"❌ Не удалось отменить пост ID:{post_id}\n"
-                    f"Возможно, пост уже опубликован или не существует"
-                )
-
-        except ValueError:
-            await update.message.reply_text("❌ Неверный ID поста")
-        except Exception as e:
-            logger.error(f"Ошибка отмены: {e}")
-            await update.message.reply_text("❌ Ошибка отмены поста")
-
-    async def reschedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Перенос публикации"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-
-        if len(context.args) < 2:
-            await update.message.reply_text(
-                "❌ Используйте: /reschedule ID ВРЕМЯ\n\n"
-                "Пример: /reschedule 5 18:00"
-            )
-            return
-
-        try:
-            post_id = int(context.args[0])
-            time_input = ' '.join(context.args[1:])
-
-            new_time = self.parse_time_input(time_input)
-            if not new_time:
-                await update.message.reply_text("❌ Неверный формат времени")
-                return
-
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-
-            cursor.execute('''
-                UPDATE scheduled_posts 
-                SET scheduled_time = ?
-                WHERE id = ? AND user_id = ? AND status = 'scheduled'
-            ''', (new_time, post_id, user_id))
-
-            affected = cursor.rowcount
-            conn.commit()
-            conn.close()
-
-            if affected > 0:
-                await update.message.reply_text(
-                    f"✅ Пост ID:{post_id} перенесен на {new_time.strftime('%d.%m.%Y %H:%M')}"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Не удалось перенести пост ID:{post_id}\n"
-                    f"Возможно, пост уже опубликован или не существует"
-                )
-
-        except ValueError:
-            await update.message.reply_text("❌ Неверный ID поста")
-        except Exception as e:
-            logger.error(f"Ошибка переноса: {e}")
-            await update.message.reply_text("❌ Ошибка переноса поста")
-
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статистика публикаций"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-
-        try:
-            stats = db.get_post_stats(user_id)
-            schedule = db.get_user_schedule(user_id, days=7)
-
-            stats_text = f"""
-📊 **Статистика публикаций**
-
-📨 Всего постов: {stats['total']}
-✅ Опубликовано: {stats['published']}
-⏳ Запланировано: {stats['scheduled']}
-❌ Отменено: {stats['cancelled']}
-
-📅 **На этой неделе:**
-"""
-
-            if schedule:
-                # Группируем по дням
-                from collections import defaultdict
-                daily_stats = defaultdict(int)
-
-                for post in schedule:
-                    date = datetime.strptime(post['scheduled_time'], '%Y-%m-%d %H:%M:%S').strftime('%a')
-                    daily_stats[date] += 1
-
-                for day, count in daily_stats.items():
-                    stats_text += f"   {day}: {count} пост(ов)\n"
-            else:
-                stats_text += "   Нет запланированных постов\n"
-
-            stats_text += "\n💡 Используйте /schedule для добавления новых постов"
-
-            await update.message.reply_text(stats_text, parse_mode='Markdown')
-
-        except Exception as e:
-            logger.error(f"Ошибка статистики: {e}")
-            await update.message.reply_text("❌ Ошибка загрузки статистики")
-
-    async def publish_now_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Принудительно опубликовать пост"""
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-            return
-
-        if not context.args:
-            await update.message.reply_text("❌ Укажите ID поста: /publish_now 123")
-            return
-
-        try:
-            post_id = int(context.args[0])
-
-            # Получаем пост из БД
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM scheduled_posts WHERE id = ?', (post_id,))
-            post_data = cursor.fetchone()
-            conn.close()
-
-            if not post_data:
-                await update.message.reply_text(f"❌ Пост с ID {post_id} не найден")
-                return
-
-            if post_data[6] == 'published':
-                await update.message.reply_text(f"❌ Пост ID {post_id} уже опубликован")
-                return
-
-            # Создаем структуру поста для публикации
-            post = {
-                'id': post_data[0],
-                'user_id': post_data[1],
-                'content_type': post_data[2],
-                'file_path': post_data[3],
-                'caption': post_data[4],
-                'scheduled_time': post_data[5],
-                'status': post_data[6]
             }
 
-            print(f"DEBUG: 🚀 Принудительная публикация поста {post_id}")
-
-            # Публикуем пост
             success = await scheduler.publish_post(post)
 
             if success:
-                await update.message.reply_text(f"✅ Пост ID {post_id} успешно опубликован!")
+                await update.message.reply_text("✅ Пост успешно опубликован!")
             else:
-                await update.message.reply_text(f"❌ Ошибка публикации поста ID {post_id}")
+                await update.message.reply_text("❌ Ошибка при публикации поста.")
+
+            # Очищаем флаг публикации
+            context.user_data['publish_now'] = False
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            context.user_data['publish_now'] = False
 
-    async def debug_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для отладки"""
+    async def cancel_post_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /cancel_post - отмена запланированного поста"""
         user_id = update.effective_user.id
+        args = context.args
 
-        if user_id not in ADMIN_IDS:
+        if not args:
+            await update.message.reply_text(
+                "❌ <b>Отмена поста</b>\n\n"
+                "Использование: /cancel_post ID_поста\n\n"
+                "Пример:\n"
+                "<code>/cancel_post 123</code>\n\n"
+                "Чтобы узнать ID поста, используйте /myschedule",
+                parse_mode='HTML'
+            )
             return
 
-        # Проверяем планировщик
-        posts_to_publish = scheduler.get_posts_to_publish()
-        all_posts = db.get_user_schedule(user_id, days=30)
+        try:
+            post_id = int(args[0])
 
-        response = f"""
-🔧 **Отладочная информация:**
+            # Отменяем пост в базе данных
+            success = db.cancel_scheduled_post(post_id, user_id)
 
-📊 **Планировщик:**
-• Постов для публикации: {len(posts_to_publish)}
-• Всего запланировано: {len([p for p in all_posts if p['status'] == 'scheduled'])}
-• Опубликовано: {len([p for p in all_posts if p['status'] == 'published'])}
+            if success:
+                await update.message.reply_text(
+                    f"✅ Пост с ID {post_id} отменен."
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Не удалось отменить пост с ID {post_id}.\n"
+                    f"Возможно, пост не существует или у вас нет прав для его отмены."
+                )
 
-⏰ **Время:**
-• Сервер: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
-• UTC: {datetime.utcnow().strftime('%d.%m.%Y %H:%M:%S')}
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID поста. ID должен быть числом.")
 
-🔄 **Состояние:**
-• User ID: {user_id}
-• State: {self.get_user_state(user_id)}
-"""
-
-        await update.message.reply_text(response, parse_mode='Markdown')
-
-    async def check_files_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Проверка загруженных файлов"""
+    async def reschedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /reschedule - перенос публикации"""
         user_id = update.effective_user.id
+        args = context.args
 
-        if user_id not in ADMIN_IDS:
+        if not args or len(args) < 2:
+            await update.message.reply_text(
+                "🕐 <b>Перенос публикации</b>\n\n"
+                "Использование: /reschedule ID_поста новое_время\n\n"
+                "Пример:\n"
+                "<code>/reschedule 123 2024-12-31 20:00</code>\n\n"
+                "Чтобы узнать ID поста, используйте /myschedule",
+                parse_mode='HTML'
+            )
             return
 
-        content_manager.list_uploaded_files()
+        try:
+            post_id = int(args[0])
+            new_time = ' '.join(args[1:])
 
-        await update.message.reply_text(
-            "🔍 Проверка файлов выполнена. Смотрите вывод в консоли."
-        )
+            # Парсим новое время
+            scheduled_time = self.parse_time_input(new_time)
 
-    def get_media_emoji(self, media_type):
-        """Получить emoji для типа медиа"""
-        emoji_map = {
-            'photo': '📷',
-            'video': '🎥',
-            'document': '📄',
-            'text': '📝'
-        }
-        return emoji_map.get(media_type, '📁')
+            if scheduled_time <= datetime.now():
+                await update.message.reply_text("❌ Время публикации должно быть в будущем!")
+                return
 
+            # Обновляем время поста в базе данных
+            success = db.reschedule_post(post_id, user_id, scheduled_time)
 
-async def main():
-    """Основная функция"""
-    bot = TelegramSchedulerBot()
+            if success:
+                await update.message.reply_text(
+                    f"✅ Время публикации поста {post_id} изменено на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Не удалось перенести пост с ID {post_id}.\n"
+                    f"Возможно, пост не существует, у вас нет прав или он уже опубликован/отменен."
+                )
 
-    print("🚀 Запуск улучшенного бота-планировщика...")
-    print("🌟 Новые функции:")
-    print("   • 📋 Меню команд в интерфейсе Telegram")
-    print("   • ✨ Автоформатирование текста с эмодзи")
-    print("   • 🏷️ Умные хештеги из текста")
-    print("   • 💾 Исправлено сохранение файлов")
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-    try:
-        # ЗАПУСКАЕМ ОБА ПЛАНИРОВЩИКА
-        print("🔄 Запускаем планировщики...")
-        scheduler_task1 = asyncio.create_task(scheduler.start_scheduler())
-        scheduler_task2 = asyncio.create_task(scheduler.simple_scheduler())
+    def run(self):
+        """Запуск бота"""
+        print("🤖 Бот запускается...")
 
-        # Даем планировщику время на запуск
-        await asyncio.sleep(2)
+        # Запуск планировщика в отдельном потоке
+        import threading
 
-        # ЗАПУСКАЕМ БОТА
-        print("🤖 Запускаем бота...")
-        await bot.start_bot()
+        def run_scheduler():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(scheduler.start_scheduler())
 
-        # Ждем завершения обеих задач
-        print("⏳ Система запущена. Ожидаем команды...")
-        await asyncio.gather(scheduler_task1, scheduler_task2, return_exceptions=True)
+        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
 
-    except KeyboardInterrupt:
-        print("🛑 Получен сигнал остановки...")
-    except Exception as e:
-        print(f"💥 Ошибка в main: {e}")
-    finally:
-        print("🧹 Останавливаем систему...")
-        # Останавливаем планировщик
-        scheduler.stop_scheduler()
-
-        # Останавливаем бота
-        await bot.stop_bot()
-
-        print("✅ Система остановлена")
+        # Запускаем бота
+        print("✅ Бот успешно запущен!")
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    bot = TelegramAutopostBot()
+    bot.run()

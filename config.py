@@ -1,9 +1,7 @@
 import os
 
 # Конфигурация бота
-BOT_TOKEN = "6104374357:AAGO3m_9dLf5u6-PeKNZ6UmHjngV97JcD-Q"
-CHANNEL_ID = "@kino_serialy_aktery"
-ADMIN_IDS = [818131608]  # Ваш ID в Telegram
+BOT_TOKEN = "6104374357:AAGO3m_9dLf5u6-PeKNZ6UmHjngV97JcD-Q"  # Замените на ваш токен
 
 # Настройки базы данных
 DB_FILE = "scheduler_database.db"

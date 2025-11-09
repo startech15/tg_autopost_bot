@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import random
 
 # Импортируем конфигурацию
-from config import DB_FILE, CHECK_INTERVAL, CHANNEL_ID, BOT_TOKEN
+from config import DB_FILE, CHECK_INTERVAL, BOT_TOKEN
 from database import ContentDatabase
 from content_manager import ContentManager
 from telegram import Bot
@@ -59,20 +59,21 @@ class PostScheduler:
 
                 for post_data in all_scheduled:
                     try:
-                        post_time = datetime.strptime(post_data[5], '%Y-%m-%d %H:%M:%S')
+                        post_time = datetime.strptime(post_data[6], '%Y-%m-%d %H:%M:%S')
 
                         # Если время публикации наступило
                         if post_time <= current_time:
-                            print(f"🛠️ Упрощенный планировщик: публикую пост {post_data[0]}")
+                            print(f"🛠️ Упрощенный планировщик: публикую пост {post_data[0]} в канал {post_data[2]}")
 
                             post = {
                                 'id': post_data[0],
                                 'user_id': post_data[1],
-                                'content_type': post_data[2],
-                                'file_path': post_data[3],
-                                'caption': post_data[4],
-                                'scheduled_time': post_data[5],
-                                'status': post_data[6]
+                                'channel_id': post_data[2],
+                                'content_type': post_data[3],
+                                'file_path': post_data[4],
+                                'caption': post_data[5],
+                                'scheduled_time': post_data[6],
+                                'status': post_data[7]
                             }
 
                             success = await self.publish_post(post)
@@ -98,19 +99,18 @@ class PostScheduler:
             print(f"DEBUG: 📊 Основной планировщик нашел {len(posts_to_publish)} постов")
 
         for post in posts_to_publish:
-            print(f"DEBUG: 🚀 Основной планировщик: публикую пост ID: {post['id']}")
+            print(f"DEBUG: 🚀 Основной планировщик: публикую пост ID: {post['id']} в канал {post['channel_id']}")
             success = await self.publish_post(post)
             if success:
                 print(f"DEBUG: ✅ Пост ID:{post['id']} опубликован через основной планировщик")
 
     def get_posts_to_publish(self):
-        """Получение постов для публикации - УПРОЩЕННАЯ ВЕРСИЯ"""
+        """Получение постов для публикации"""
         print("DEBUG: 🔍 Основной планировщик ищет посты для публикации")
 
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
 
-        # ПРОСТОЙ ЗАПРОС: все scheduled посты
         cursor.execute('''
             SELECT * FROM scheduled_posts 
             WHERE status = 'scheduled'
@@ -125,18 +125,18 @@ class PostScheduler:
 
         for post_data in all_scheduled:
             try:
-                post_time = datetime.strptime(post_data[5], '%Y-%m-%d %H:%M:%S')
+                post_time = datetime.strptime(post_data[6], '%Y-%m-%d %H:%M:%S')
 
-                # Если время публикации наступило ИЛИ прошло
                 if post_time <= current_time:
                     posts_to_publish.append({
                         'id': post_data[0],
                         'user_id': post_data[1],
-                        'content_type': post_data[2],
-                        'file_path': post_data[3],
-                        'caption': post_data[4],
-                        'scheduled_time': post_data[5],
-                        'status': post_data[6]
+                        'channel_id': post_data[2],
+                        'content_type': post_data[3],
+                        'file_path': post_data[4],
+                        'caption': post_data[5],
+                        'scheduled_time': post_data[6],
+                        'status': post_data[7]
                     })
             except Exception as e:
                 print(f"DEBUG: ❌ Ошибка обработки поста {post_data[0]}: {e}")
@@ -146,7 +146,7 @@ class PostScheduler:
 
     async def publish_post(self, post):
         """Публикация отдельного поста с форматированием текста"""
-        print(f"DEBUG: 🚀 Публикация поста ID: {post['id']}")
+        print(f"DEBUG: 🚀 Публикация поста ID: {post['id']} в канал {post['channel_id']}")
 
         try:
             file_path = self.content_manager.get_file_path(post['file_path'])
@@ -164,37 +164,37 @@ class PostScheduler:
                 caption = self.format_text(caption)
 
             if post['content_type'] == 'photo':
-                print(f"DEBUG: 📷 Публикуем фото")
+                print(f"DEBUG: 📷 Публикуем фото в {post['channel_id']}")
                 with open(file_path, 'rb') as photo:
                     message = await self.bot.send_photo(
-                        chat_id=CHANNEL_ID,
+                        chat_id=post['channel_id'],
                         photo=photo,
                         caption=caption,
                         parse_mode='HTML'
                     )
 
             elif post['content_type'] == 'video':
-                print(f"DEBUG: 🎥 Публикуем видео")
+                print(f"DEBUG: 🎥 Публикуем видео в {post['channel_id']}")
                 with open(file_path, 'rb') as video:
                     message = await self.bot.send_video(
-                        chat_id=CHANNEL_ID,
+                        chat_id=post['channel_id'],
                         video=video,
                         caption=caption,
                         parse_mode='HTML'
                     )
 
             elif post['content_type'] == 'document':
-                print(f"DEBUG: 📄 Публикуем документ")
+                print(f"DEBUG: 📄 Публикуем документ в {post['channel_id']}")
                 with open(file_path, 'rb') as document:
                     message = await self.bot.send_document(
-                        chat_id=CHANNEL_ID,
+                        chat_id=post['channel_id'],
                         document=document,
                         caption=caption,
                         parse_mode='HTML'
                     )
 
             elif post['content_type'] == 'text':
-                print(f"DEBUG: 📝 Публикуем текст")
+                print(f"DEBUG: 📝 Публикуем текст в {post['channel_id']}")
                 with open(file_path, 'r', encoding='utf-8') as f:
                     text_content = f.read()
 
@@ -202,16 +202,16 @@ class PostScheduler:
                 text_content = self.format_text(text_content)
 
                 message = await self.bot.send_message(
-                    chat_id=CHANNEL_ID,
+                    chat_id=post['channel_id'],
                     text=text_content,
                     parse_mode='HTML'
                 )
 
             if message is None:
-                print(f"DEBUG: ❌ Сообщение не было отправлено")
+                print(f"DEBUG: ❌ Сообщение не было отправлено в {post['channel_id']}")
                 return False
 
-            print(f"DEBUG: 💬 Сообщение отправлено. Message ID: {message.message_id}")
+            print(f"DEBUG: 💬 Сообщение отправлено в {post['channel_id']}. Message ID: {message.message_id}")
 
             # Обновляем статус в БД
             success = self.mark_as_published(post['id'], message.message_id)
@@ -220,14 +220,14 @@ class PostScheduler:
                 # Очищаем временные файлы для текстовых постов
                 if post['content_type'] == 'text':
                     self.content_manager.cleanup_file(file_path)
-                print(f"DEBUG: ✅ Пост {post['id']} успешно опубликован")
+                print(f"DEBUG: ✅ Пост {post['id']} успешно опубликован в {post['channel_id']}")
                 return True
             else:
                 print(f"DEBUG: ❌ Не удалось обновить статус в БД")
                 return False
 
         except Exception as e:
-            print(f"DEBUG: 💥 Ошибка публикации поста {post['id']}: {e}")
+            print(f"DEBUG: 💥 Ошибка публикации поста {post['id']} в {post['channel_id']}: {e}")
             import traceback
             print(f"DEBUG: 🗂️ Трассировка: {traceback.format_exc()}")
             return False
@@ -289,7 +289,15 @@ class PostScheduler:
             'интернет': ['#интернет', '#онлайн', '#digital'],
             'новост': ['#новости', '#тренды', '#обновления'],
             'обзор': ['#обзор', '#рецензия', '#тест'],
-            'совет': ['#советы', '#лайфхаки', '#рекомендации']
+            'совет': ['#советы', '#лайфхаки', '#рекомендации'],
+            'кино': ['#кино', '#фильмы', '#кинопремьера'],
+            'сериал': ['#сериал', '#сериалы', '#телесериал'],
+            'актер': ['#актеры', '#актрисы', '#звезды'],
+            'режиссер': ['#режиссер', '#продюсер', '#съемки'],
+            'премьер': ['#премьера', '#новинка', '#релиз'],
+            'трейлер': ['#трейлер', '#тизер', '#анонс'],
+            'рецензи': ['#рецензия', '#отзыв', '#обзор'],
+            'награ': ['#награды', '#премия', '#оскар']
         }
 
         # Добавляем извлеченные из текста хештеги
@@ -298,11 +306,10 @@ class PostScheduler:
         # Ищем ключевые слова в тексте и добавляем соответствующие хештеги
         text_lower = text.lower()
         added_count = 0
-        max_additional_hashtags = 3  # Максимум дополнительных хештегов
+        max_additional_hashtags = 3
 
         for keyword, hashtags in keyword_hashtags.items():
             if keyword in text_lower and added_count < max_additional_hashtags:
-                # Выбираем случайный хештег из доступных для этого ключевого слова
                 selected_hashtag = random.choice(hashtags)
                 if selected_hashtag not in all_hashtags:
                     all_hashtags.append(selected_hashtag)
@@ -310,12 +317,12 @@ class PostScheduler:
 
         # Если хештегов мало, добавляем общие
         if len(all_hashtags) < 2:
-            general_hashtags = ['#технологии', '#инновации', '#гаджеты']
+            general_hashtags = ['#новости', '#интересное', '#популярное']
             for hashtag in general_hashtags:
                 if hashtag not in all_hashtags and len(all_hashtags) < 3:
                     all_hashtags.append(hashtag)
 
-        # Ограничиваем общее количество хештегов (2-5 штук)
+        # Ограничиваем общее количество хештегов
         final_hashtags = all_hashtags[:5]
 
         return ' '.join(final_hashtags) if final_hashtags else ''
